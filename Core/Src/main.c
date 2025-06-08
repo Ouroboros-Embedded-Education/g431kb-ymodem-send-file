@@ -21,12 +21,40 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
 
+#include "ymodem.h"
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "queue.h"
+#include "timers.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct{
+	bool fileIsOpen;
 
+	ymodem_t Ymodem;
+
+	uint32_t fSize;
+	uint32_t fReceived;
+
+	TaskHandle_t task;
+	QueueHandle_t RxQueue;
+	SemaphoreHandle_t TxSemaphore;
+	TimerHandle_t RstTimer;
+	bool started;
+}receive_file_t;
+
+typedef struct{
+	uint8_t raw[64];
+	uint16_t len;
+}rec_data_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -48,7 +76,9 @@ DMA_HandleTypeDef hdma_usart2_rx;
 DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
-
+receive_file_t _RecFile = {0};
+uint8_t data;
+uint32_t recBytes = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +93,167 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/*
+ * UART Callbacks
+ */
+/************************************************
+ ********* 		UART CALLBACKS
+ ************************************************/
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
+	if (huart->Instance == USART1){
+		BaseType_t taskWoken = pdFALSE;
+
+		xSemaphoreGiveFromISR(_RecFile.TxSemaphore, &taskWoken);
+	}
+	else if (huart->Instance == USART2){
+
+	}
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+	if (huart->Instance == USART1){
+		BaseType_t taskWoken = pdFALSE;
+
+		if (_RecFile.started == false){
+			return;
+		}
+		if (xQueueSendFromISR(_RecFile.RxQueue, &data, &taskWoken) != pdTRUE){
+			// lost byte
+		}
+		HAL_UART_Receive_DMA(huart, &data, sizeof(data));
+		recBytes++;
+	}
+	else if (huart->Instance == USART2){
+
+	}
+}
+
+/************************************************
+ ********* 		YMODEM LIBRARY CALLBACKS
+ ************************************************/
+ymodem_err_e ymodem_FileCallback(ymodem_t *ymodem, ymodem_file_cb_e e, uint8_t *data, uint32_t len){
+	char *FileName;
+	uint32_t i;
+
+	switch (e){
+	case YMODEM_FILE_CB_NAME:
+		if (_RecFile.fileIsOpen == false){
+			// When we receive a File, data contains the filename
+			_RecFile.fileIsOpen = true;
+			_RecFile.fSize = len;
+			_RecFile.fReceived = 0;
+			FileName = (char*)data;
+			printf(">> Receiving File request: \r\n");
+			printf(">> \tFilename: %s\r\n", FileName);
+			printf(">> \tLength: %lu\r\n", len);
+		}
+		break;
+
+	case YMODEM_FILE_CB_DATA:
+		printf(">> Received %lu bytes from Host.\r\n\t", len);
+		_RecFile.fReceived += len;
+		// Check if received chunk will overflow total file len
+		if (_RecFile.fReceived > _RecFile.fSize){
+			// fix the chunck length and ignore unused bytes
+			_RecFile.fReceived -= len;
+			len = _RecFile.fSize - _RecFile.fReceived;
+			_RecFile.fReceived += len;
+		}
+		for (i=0 ; i<len ; i++){
+			if (i > 0 && i%8 == 0){
+				printf("\r\n\t");
+			}
+			printf("%02X ", data[i]);
+		}
+		printf("\r\n");
+		break;
+
+	case YMODEM_FILE_CB_END:
+	case YMODEM_FILE_CB_ABORTED:
+		if (_RecFile.fileIsOpen == true){
+			printf(">> File is closed.\r\n");
+			_RecFile.fileIsOpen  = false;
+		}
+		break;
+	}
+
+	return YMODEM_OK;
+}
+
+/************************************************
+ ********* 		RESET Timer
+ ************************************************/
+void _RecFile_Abort_Timeout(TimerHandle_t xTimer){
+	ymodem_Reset(&_RecFile.Ymodem);
+}
+
+/************************************************
+ ********* 		SERIAL TRANSMIT WRAPPER
+ ************************************************/
+uint8_t _uart_tx(uint8_t *data, uint32_t len){
+	HAL_UART_Transmit(&huart1, data, len, 100);
+	return 0;
+}
+
+/************************************************
+ ********* 		FILE RECEIVE TASK
+ ************************************************/
+void task_receive_file(void *pvParams){
+	uint8_t C = 'C';
+	uint8_t RecData;
+	ymodem_err_e ymodemRet;
+	BaseType_t queueRet;
+
+ 	printf(">> Preparing YMODEM Application.\r\n");
+	_RecFile.TxSemaphore = xSemaphoreCreateBinary();
+	_RecFile.RxQueue = xQueueCreate(512, sizeof(data));
+	_RecFile.RstTimer = xTimerCreate("Reset Ymodem",
+									 pdMS_TO_TICKS(1500),
+									 pdFALSE,
+									 NULL,
+									 _RecFile_Abort_Timeout);
+	ymodem_Init(&_RecFile.Ymodem, _uart_tx);
+	_RecFile.started = true;
+	HAL_UART_Receive_DMA(&huart1, &data, sizeof(data));
+	printf(">> YMODEM is ready to receive Files.\r\n");
+	while(1) {
+		queueRet = xQueueReceive(_RecFile.RxQueue, &RecData, pdMS_TO_TICKS(1000));
+		if (queueRet == pdTRUE){
+			if (xTimerIsTimerActive(_RecFile.RstTimer) != pdFALSE){
+				xTimerStart(_RecFile.RstTimer, 0);
+			}
+			else{
+				xTimerReset(_RecFile.RstTimer, 0);
+			}
+
+			ymodemRet = ymodem_ReceiveByte(&_RecFile.Ymodem, RecData);
+			switch (ymodemRet){
+			case YMODEM_OK:
+
+				break;
+			case YMODEM_TX_PENDING:
+
+				break;
+			case YMODEM_ABORTED:
+				ymodem_Reset(&_RecFile.Ymodem);
+				break;
+			case YMODEM_WRITE_ERR:
+				ymodem_Reset(&_RecFile.Ymodem);
+				break;
+			case YMODEM_SIZE_ERR:
+				ymodem_Reset(&_RecFile.Ymodem);
+				break;
+			case YMODEM_COMPLETE:
+				ymodem_Reset(&_RecFile.Ymodem);
+				break;
+			}
+		}
+		else{
+			_uart_tx(&C, 1);
+		}
+	}
+}
 
 /* USER CODE END 0 */
 
@@ -80,7 +271,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -99,7 +290,13 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_Delay(200);
+  printf(">> Starting YMODEM Application\r\n");
 
+  xTaskCreate(task_receive_file, "File Receive", 512, NULL, 1, NULL);
+
+  printf(">> Starting RTOS Scheduler.\r\n");
+  vTaskStartScheduler();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -301,8 +498,33 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+int __io_putchar (int ch){
+	HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, 10);
+	return ch;
+}
 /* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM17 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM17)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.

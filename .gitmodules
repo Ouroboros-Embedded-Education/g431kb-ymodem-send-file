@@ -1,0 +1,6 @@
+[submodule "libs/freertos"]
+	path = libs/freertos
+	url = git@github.com:Ouroboros-Embedded-Education/g431kb-ymodem-send-file.git
+[submodule "libs/ymodem"]
+	path = libs/ymodem
+	url = git@github.com:Pablo-Jean/YMODEM.git
