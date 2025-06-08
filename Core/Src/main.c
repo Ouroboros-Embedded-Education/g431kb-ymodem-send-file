@@ -26,6 +26,8 @@
 #include <stdio.h>
 
 #include "ymodem.h"
+#include "nor.h"
+#include "lfs.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -43,6 +45,8 @@ typedef struct{
 
 	uint32_t fSize;
 	uint32_t fReceived;
+
+	lfs_file_t lFile;
 
 	TaskHandle_t task;
 	QueueHandle_t RxQueue;
@@ -68,6 +72,10 @@ typedef struct{
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+SPI_HandleTypeDef hspi1;
+
+TIM_HandleTypeDef htim6;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart1_rx;
@@ -79,6 +87,10 @@ DMA_HandleTypeDef hdma_usart2_tx;
 receive_file_t _RecFile = {0};
 uint8_t data;
 uint32_t recBytes = 0;
+
+nor_t NORH;
+lfs_t LFSH;
+struct lfs_config Lfs_Config;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -87,6 +99,8 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -147,6 +161,8 @@ ymodem_err_e ymodem_FileCallback(ymodem_t *ymodem, ymodem_file_cb_e e, uint8_t *
 			printf(">> Receiving File request: \r\n");
 			printf(">> \tFilename: %s\r\n", FileName);
 			printf(">> \tLength: %lu\r\n", len);
+
+			lfs_file_open(&LFSH, &_RecFile.lFile, FileName, LFS_O_CREAT | LFS_O_RDWR);
 		}
 		break;
 
@@ -167,6 +183,8 @@ ymodem_err_e ymodem_FileCallback(ymodem_t *ymodem, ymodem_file_cb_e e, uint8_t *
 			printf("%02X ", data[i]);
 		}
 		printf("\r\n");
+
+		lfs_file_write(&LFSH, &_RecFile.lFile, data, len);
 		break;
 
 	case YMODEM_FILE_CB_END:
@@ -174,6 +192,8 @@ ymodem_err_e ymodem_FileCallback(ymodem_t *ymodem, ymodem_file_cb_e e, uint8_t *
 		if (_RecFile.fileIsOpen == true){
 			printf(">> File is closed.\r\n");
 			_RecFile.fileIsOpen  = false;
+
+			lfs_file_close(&LFSH, &_RecFile.lFile);
 		}
 		break;
 	}
@@ -197,6 +217,125 @@ uint8_t _uart_tx(uint8_t *data, uint32_t len){
 }
 
 /************************************************
+ ********* 		INITIALIZE FLASH NOR
+ ************************************************/
+void _w25_assert(){
+	HAL_GPIO_WritePin(NOR_CS_GPIO_Port, NOR_CS_Pin, GPIO_PIN_RESET);
+}
+
+void _w25_deassert(){
+	HAL_GPIO_WritePin(NOR_CS_GPIO_Port, NOR_CS_Pin, GPIO_PIN_SET);
+}
+
+void _w25_spi_send(uint8_t* data, uint32_t len){
+	if (HAL_SPI_Transmit(&hspi1, data, len, 100) != HAL_OK){
+		return;
+	}
+}
+
+void _w25_spi_receive(uint8_t* data, uint32_t len){
+	if (HAL_SPI_Receive(&hspi1, data, len, 100) != HAL_OK){
+		return;
+	}
+}
+
+void _w25_delay_us(uint32_t us){
+	uint32_t a;
+
+	__HAL_TIM_SET_AUTORELOAD(&htim6, UINT16_MAX);
+	HAL_TIM_Base_Start(&htim6);
+	do {
+		__HAL_TIM_SET_COUNTER(&htim6, 0);
+		if (us >= UINT16_MAX){
+			a = UINT16_MAX - 1;
+		}
+		else{
+			a = us;
+		}
+		while(__HAL_TIM_GET_COUNTER(&htim6) < a);
+
+		us -= a;
+	}while (us > 0);
+	HAL_TIM_Base_Stop(&htim6);
+
+}
+
+void W25_Init(){
+	NORH.config.CsAssert = _w25_assert;
+	NORH.config.CsDeassert = _w25_deassert;
+	NORH.config.DelayUs = _w25_delay_us;
+	NORH.config.MutexLockFxn = NULL;
+	NORH.config.MutexUnlockFxn = NULL;
+	NORH.config.SpiRxFxn = _w25_spi_receive;
+	NORH.config.SpiTxFxn = _w25_spi_send;
+
+	assert(NOR_Init(&NORH) == NOR_OK);
+}
+
+/************************************************
+ ********* 		INITIALIZE LITTLEFS
+ ************************************************/
+int __read_sector(const struct lfs_config *c, lfs_block_t block,
+                  lfs_off_t off, void *buffer, lfs_size_t size){
+    uint32_t address = (block * c->block_size) + off;
+
+    if (NOR_ReadBytes(&NORH, (uint8_t*)buffer, address, size) != NOR_OK){
+    	return -1;
+    }
+
+	return LFS_ERR_OK;
+}
+
+int __write_sector(const struct lfs_config *c, lfs_block_t block,
+            lfs_off_t off, const void *buffer, lfs_size_t size){
+    uint32_t address = (block * c->block_size) + off;
+
+    if (NOR_WriteBytes(&NORH, (uint8_t*)buffer, address, size) != NOR_OK){
+    	return -1;
+    }
+
+	return LFS_ERR_OK;
+}
+
+int __erase_sector(const struct lfs_config *c, lfs_block_t block){
+    if (NOR_EraseSector(&NORH, block) !=  NOR_OK){
+    	return -1;
+    }
+
+	return LFS_ERR_OK;
+}
+
+int __sync_sector(const struct lfs_config *c){
+    return 0;
+}
+
+
+void LittleFs_Init(){
+    enum lfs_error err;
+
+    Lfs_Config.read = __read_sector;
+    Lfs_Config.prog = __write_sector;
+    Lfs_Config.erase = __erase_sector;
+    Lfs_Config.sync = __sync_sector;
+
+    Lfs_Config.block_size = NORH.info.u16SectorSize;
+    Lfs_Config.block_count = NORH.info.u32SectorCount;
+    Lfs_Config.lookahead_size = NORH.info.u16SectorSize/8;
+    Lfs_Config.read_size = 64;
+    Lfs_Config.prog_size = 64;
+    Lfs_Config.cache_size = 64;
+    Lfs_Config.block_cycles = 256;
+
+    err = lfs_mount(&LFSH, &Lfs_Config);
+    if (err != LFS_ERR_OK){
+    	err = lfs_format(&LFSH, &Lfs_Config);
+		err = lfs_mount(&LFSH, &Lfs_Config);
+    }
+    assert (err == LFS_ERR_OK);
+}
+
+
+/************************************************
  ********* 		FILE RECEIVE TASK
  ************************************************/
 void task_receive_file(void *pvParams){
@@ -204,6 +343,8 @@ void task_receive_file(void *pvParams){
 	uint8_t RecData;
 	ymodem_err_e ymodemRet;
 	BaseType_t queueRet;
+	bool readFile = false;
+	char fileToRead[32] = "message.txt";
 
  	printf(">> Preparing YMODEM Application.\r\n");
 	_RecFile.TxSemaphore = xSemaphoreCreateBinary();
@@ -252,6 +393,25 @@ void task_receive_file(void *pvParams){
 		else{
 			_uart_tx(&C, 1);
 		}
+		if (readFile == true){
+			lfs_file_t file;
+			lfs_size_t rd;
+			char temp[128];
+
+			readFile = false;
+			lfs_file_open(&LFSH, &file, fileToRead, LFS_O_RDONLY);
+			printf(">> Reading data from file %s\r\n ", fileToRead);
+			do{
+				rd = lfs_file_read(&LFSH, &file, temp, 128);
+				for (int i=0 ; i<rd ; i++){
+					printf("%c", temp[i]);
+					if (temp[i] == '\n'){
+						printf("\r");
+					}
+				}
+			}while (rd>0);
+			lfs_file_close(&LFSH, &file);
+		}
 	}
 }
 
@@ -271,7 +431,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-   HAL_Init();
+  HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -289,11 +449,16 @@ int main(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
+  MX_SPI1_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
   HAL_Delay(200);
   printf(">> Starting YMODEM Application\r\n");
-
   xTaskCreate(task_receive_file, "File Receive", 512, NULL, 1, NULL);
+
+  printf(">> Starting LittleFs File System.\r\n");
+  W25_Init();
+  LittleFs_Init();
 
   printf(">> Starting RTOS Scheduler.\r\n");
   vTaskStartScheduler();
@@ -354,6 +519,84 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 99;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 65535;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
 }
 
 /**
@@ -485,12 +728,24 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(NOR_CS_GPIO_Port, NOR_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : NOR_CS_Pin */
+  GPIO_InitStruct.Pin = NOR_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(NOR_CS_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

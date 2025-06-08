@@ -4,3 +4,9 @@
 [submodule "libs/ymodem"]
 	path = libs/ymodem
 	url = git@github.com:Pablo-Jean/YMODEM.git
+[submodule "libs/nor"]
+	path = libs/nor
+	url = git@github.com:Pablo-Jean/Nor-Flash-Driver.git
+[submodule "libs/littlefs"]
+	path = libs/littlefs
+	url = git@github.com:littlefs-project/littlefs.git
