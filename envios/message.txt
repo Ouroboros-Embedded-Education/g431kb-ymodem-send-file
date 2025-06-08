@@ -1,0 +1,27 @@
+>>> YMODEM <<<
+O YModem é um protocolo de transferência de arquivos desenvolvido para comunicação entre microcomputadores, especialmente em conexões modem-modem, muito utilizado nas décadas de 1980 e 1990 para transferências em sistemas BBS (Bulletin Board Systems). Ele foi criado por Chuck Forsberg como uma evolução do XModem, buscando maior eficiência, confiabilidade e funcionalidades adicionais.
+
+Principais Características do YModem
+Transferência em lote (batch): Uma das principais inovações do YModem é a capacidade de transferir múltiplos arquivos em uma única sessão, diferentemente do XModem, que só permitia um arquivo por vez.
+
+Envio de informações do arquivo: O YModem introduziu o “bloco zero”, um pacote especial que transmite o nome do arquivo, seu tamanho e outros atributos antes do início da transferência dos dados. Isso facilita a automação e o gerenciamento dos arquivos recebidos.
+
+Pacotes maiores: Permite o uso de blocos de 1024 bytes (1k), além dos tradicionais 128 bytes, o que aumenta significativamente a velocidade de transferência em linhas rápidas.
+
+Verificação de erros aprimorada: Utiliza CRC-16 (Cyclic Redundancy Check) como padrão para detecção de erros, tornando a transmissão mais confiável em relação ao simples checksum de 8 bits do XModem.
+
+Compatibilidade: O protocolo foi projetado para ser flexível, podendo recuar para modos compatíveis com XModem caso o receptor não suporte todas as funcionalidades do YModem.
+
+Funcionamento Básico
+A transferência com YModem é iniciada pelo receptor, que envia um caractere especial (“C”) para indicar que deseja usar CRC-16. O transmissor responde enviando o bloco zero com informações do arquivo, seguido pelos blocos de dados. Ao final de cada arquivo, é enviado um sinal de término (EOT) e, caso haja mais arquivos, o processo recomeça com um novo bloco zero. Para encerrar a sessão, um bloco zero vazio é transmitido.
+
+Variações e Evolução
+YModem-G: Uma variante do protocolo, chamada YModem-G, permite transferências em streaming, sem esperar confirmações (ACK) a cada bloco, indicada para conexões consideradas livres de erros. Isso aumenta a velocidade, mas elimina a capacidade de correção de erros durante a transmissão.
+
+Compatibilidade e Implementações: Nem todas as implementações do YModem suportam todas as funcionalidades, especialmente o bloco zero, o que pode gerar incompatibilidades. Por isso, distingue-se o “YModem Batch” (completo) das versões simplificadas.
+
+Importância Histórica
+O YModem foi fundamental para aumentar a eficiência e confiabilidade das transferências de arquivos em redes de computadores e modems, especialmente antes da popularização de protocolos mais modernos como o ZModem e o FTP. Seu legado está na introdução de conceitos como transferência em lote, envio de metadados e verificação robusta de erros, que influenciaram protocolos posteriores.
+
+Resumo:
+YModem é um protocolo de transferência de arquivos que aprimorou o XModem ao permitir envio de múltiplos arquivos, maior velocidade e melhor verificação de erros, sendo um marco importante na evolução das comunicações seriais e de redes.
